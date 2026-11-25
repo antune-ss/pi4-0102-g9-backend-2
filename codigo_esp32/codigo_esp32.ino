@@ -1,13 +1,15 @@
 /*
- * CO2NNECT - Backend 2 | ESP32-S3 + Sensirion SCD30 + OLED SSD1306
- * Arduino-ESP32; bibliotecas: SparkFun SCD30 Arduino Library,
- * PubSubClient, Adafruit GFX Library, Adafruit SSD1306.
- * Copie config.example.h para config.h e configure Wi-Fi / broker.
- * MQTT: co2nect/{DEVICE_ID}/telemetry e co2nect/{DEVICE_ID}/status
+- CO2NNECT | ESP32-S3 + SCD30 + 2 OLED SSD1306 (128x64)
+- I2C principal Wire: SDA GPIO4, SCL GPIO5 -> SCD30 (0x61) e OLED1 CO2 (0x3C)
+- I2C secundario Wire1: SDA GPIO6, SCL GPIO7 -> OLED2 temp/umidade (0x3C)
+- Bibliotecas: SparkFun SCD30 Arduino Library, PubSubClient,
+- Adafruit GFX Library, Adafruit SSD1306.  
+- Copie config.example.h para config.h na mesma pasta deste .ino.
  */
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <SparkFun_SCD30_Arduino_Library.h>
 #include <Adafruit_GFX.h>
@@ -16,8 +18,10 @@
 #include <math.h>
 #include "config.h"
 
-constexpr uint8_t SDA_PIN = 8;
-constexpr uint8_t SCL_PIN = 9;
+constexpr uint8_t MAIN_SDA_PIN = 4;
+constexpr uint8_t MAIN_SCL_PIN = 5;
+constexpr uint8_t SECOND_SDA_PIN = 6;
+constexpr uint8_t SECOND_SCL_PIN = 7;
 constexpr uint8_t OLED_ADDR = 0x3C;
 constexpr uint32_t SENSOR_RETRY_MS = 5000;
 constexpr uint32_t SENSOR_POLL_MS = 2000;
@@ -28,13 +32,18 @@ constexpr uint32_t MQTT_RETRY_MS = 5000;
 constexpr uint32_t OLED_REFRESH_MS = 1000;
 constexpr uint32_t SERIAL_BAUD = 115200;
 
+TwoWire secondaryI2C = TwoWire(1);
 SCD30 scd30;
-Adafruit_SSD1306 display(128, 64, &Wire, -1);
-WiFiClient wifiClient;
-PubSubClient mqtt(wifiClient);
+Adafruit_SSD1306 oledCO2(128, 64, &Wire, -1);
+Adafruit_SSD1306 oledClimate(128, 64, &secondaryI2C, -1);
+
+// CORREÇÃO: Utilizando WiFiClientSecure para suportar a porta 8883 (TLS/EMQX Cloud)
+WiFiClientSecure secureClient;
+PubSubClient mqtt(secureClient);
 
 bool sensorReady = false;
-bool oledReady = false;
+bool oledCO2Ready = false;
+bool oledClimateReady = false;
 bool hasReading = false;
 uint16_t lastCO2 = 0;
 float lastTemp = NAN;
@@ -50,16 +59,15 @@ String telemetryTopic;
 String statusTopic;
 String mqttClientId;
 
-bool timeIsValid() {
-  time_t now = time(nullptr);
-  return now > 1700000000; // Relogio sincronizado (posterior a 2023)
+bool readingFresh(uint32_t now) {
+  return hasReading && (now - lastReadingMs <= SENSOR_STALE_MS);
 }
 
 bool timestampUtc(char* out, size_t len) {
-  if (!timeIsValid()) return false;
-  time_t now = time(nullptr);
+  time_t current = time(nullptr);
+  if (current <= 1700000000) return false;
   struct tm utc;
-  if (gmtime_r(&now, &utc) == nullptr) return false;
+  if (gmtime_r(&current, &utc) == nullptr) return false;
   return strftime(out, len, "%Y-%m-%dT%H:%M:%SZ", &utc) > 0;
 }
 
@@ -75,27 +83,34 @@ void connectMqttIfNeeded(uint32_t now) {
   if (WiFi.status() != WL_CONNECTED || mqtt.connected()) return;
   if (lastMqttAttempt != 0 && now - lastMqttAttempt < MQTT_RETRY_MS) return;
   lastMqttAttempt = now;
-  // LWT: broker publica '0' retido quando conexao MQTT cai inesperadamente.
-  bool ok = mqtt.connect(mqttClientId.c_str(), statusTopic.c_str(), 1, true, "0");
+
+  // Aguarda sincronização de relógio NTP antes de tentar o handshake TLS
+  time_t nowSecs = time(nullptr);
+  if (nowSecs < 1700000000) {
+    Serial.println("[MQTT] Aguardando sincronizacao de horario (NTP) para validar o certificado TLS...");
+    return;
+  }
+
+  Serial.println("[MQTT] Conectando ao broker via TLS (Porta 8883)...");
+  bool ok = mqtt.connect(mqttClientId.c_str(), MQTT_USER, MQTT_PASSWORD, statusTopic.c_str(), 1, true, "0");
   if (!ok) {
-    Serial.printf("[MQTT] Falha ao conectar, state=%d\n", mqtt.state());
+    Serial.printf("[MQTT] Falha ao conectar: rc=%d\n", mqtt.state());
     return;
   }
   mqtt.publish(statusTopic.c_str(), "1", true);
-  Serial.println("[MQTT] Conectado; status online publicado.");
+  Serial.println("[MQTT] Conectado com sucesso; status online publicado.");
 }
 
 void initSensorIfNeeded(uint32_t now) {
   if (sensorReady) return;
   if (lastSensorAttempt != 0 && now - lastSensorAttempt < SENSOR_RETRY_MS) return;
   lastSensorAttempt = now;
-  sensorReady = scd30.begin(Wire); // Biblioteca SparkFun; endereco I2C 0x61
+  sensorReady = scd30.begin(Wire);
   if (sensorReady) {
-    Serial.println("[SCD30] Inicializado.");
-    // A taxa padrao e 2 s; configura explicitamente.
     scd30.setMeasurementInterval(2);
+    Serial.println("[SCD30] Inicializado no barramento Wire (GPIO4/5).");
   } else {
-    Serial.println("[SCD30] Ausente; nova tentativa em 5 s.");
+    Serial.println("[SCD30] Nao encontrado; nova tentativa em 5 s.");
   }
 }
 
@@ -106,33 +121,33 @@ void pollSensor(uint32_t now) {
     if (hasReading && now - lastReadingMs > SENSOR_STALE_MS) {
       hasReading = false;
       sensorReady = false;
-      Serial.println("[SCD30] Sem dados recentes; reinicializando.");
+      Serial.println("[SCD30] Leitura expirada; reinicializando sensor.");
     }
     return;
   }
-  const uint16_t co2 = scd30.getCO2();
-  const float temp = scd30.getTemperature();
-  const float hum = scd30.getHumidity();
-  if (co2 == 0 || !isfinite(temp) || !isfinite(hum) ||
-      temp < -40 || temp > 100 || hum < 0 || hum > 100) {
+  uint16_t co2 = scd30.getCO2();
+  float temp = scd30.getTemperature();
+  float humidity = scd30.getHumidity();
+  if (co2 == 0 || !isfinite(temp) || !isfinite(humidity) ||
+      temp < -40 || temp > 100 || humidity < 0 || humidity > 100) {
     Serial.println("[SCD30] Leitura invalida descartada.");
     return;
   }
   lastCO2 = co2;
   lastTemp = temp;
-  lastHumidity = hum;
+  lastHumidity = humidity;
   hasReading = true;
   lastReadingMs = now;
-  Serial.printf("[SCD30] CO2=%u ppm | T=%.1f C | UR=%.1f %%\n", co2, temp, hum);
+  Serial.printf("[SCD30] CO2=%u ppm | T=%.1f C | UR=%.1f %%\n", co2, temp, humidity);
 }
 
 void publishReading(uint32_t now) {
   if (now - lastPublishMs < MQTT_SEND_MS) return;
   lastPublishMs = now;
-  if (!hasReading || now - lastReadingMs > SENSOR_STALE_MS || !mqtt.connected()) return;
+  if (!readingFresh(now) || !mqtt.connected()) return;
   char timestamp[25];
   if (!timestampUtc(timestamp, sizeof(timestamp))) {
-    Serial.println("[MQTT] Aguardando sincronizacao NTP; medicao nao enviada.");
+    Serial.println("[MQTT] Aguardando horario NTP.");
     return;
   }
   char json[256];
@@ -146,58 +161,97 @@ void publishReading(uint32_t now) {
   if (mqtt.publish(telemetryTopic.c_str(), json)) {
     Serial.printf("[MQTT] %s -> %s\n", telemetryTopic.c_str(), json);
   } else {
-    Serial.println("[MQTT] Falha ao publicar medicao.");
+    Serial.println("[MQTT] Falha na publicacao.");
   }
 }
 
-void refreshOled(uint32_t now) {
-  if (!oledReady || now - lastOledMs < OLED_REFRESH_MS) return;
+void refreshOleds(uint32_t now) {
+  if (now - lastOledMs < OLED_REFRESH_MS) return;
   lastOledMs = now;
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.print("CO2NNECT  ");
-  display.println(mqtt.connected() ? "MQTT OK" : "LOCAL");
-  display.drawLine(0, 11, 127, 11, SSD1306_WHITE);
-  if (!hasReading || now - lastReadingMs > SENSOR_STALE_MS) {
-    display.setCursor(0, 23);
-    display.println("SCD30 SEM LEITURA");
-  } else {
-    display.setCursor(0, 17);
-    display.setTextSize(2);
-    display.print(lastCO2);
-    display.setTextSize(1);
-    display.println(" ppm");
-    display.setCursor(0, 42);
-    display.print("Temp: "); display.print(lastTemp, 1); display.println(" C");
-    display.setCursor(0, 54);
-    display.print("UR:   "); display.print(lastHumidity, 1); display.println(" %");
+  const bool fresh = readingFresh(now);
+
+  if (oledCO2Ready) {
+    oledCO2.clearDisplay();
+    oledCO2.setTextColor(SSD1306_WHITE);
+    oledCO2.setTextSize(1);
+    oledCO2.setCursor(0, 0);
+    oledCO2.println("CO2NNECT | CO2");
+    oledCO2.drawLine(0, 12, 127, 12, SSD1306_WHITE);
+    if (fresh) {
+      oledCO2.setTextSize(3);
+      oledCO2.setCursor(5, 22);
+      oledCO2.print(lastCO2);
+      oledCO2.setTextSize(1);
+      oledCO2.setCursor(90, 49);
+      oledCO2.print("ppm");
+    } else {
+      oledCO2.setCursor(10, 30);
+      oledCO2.println("SEM LEITURA");
+    }
+    oledCO2.display();
   }
-  display.display();
+
+  if (oledClimateReady) {
+    oledClimate.clearDisplay();
+    oledClimate.setTextColor(SSD1306_WHITE);
+    oledClimate.setTextSize(1);
+    oledClimate.setCursor(0, 0);
+    oledClimate.println("CO2NNECT | CLIMA");
+    oledClimate.drawLine(0, 12, 127, 12, SSD1306_WHITE);
+    if (fresh) {
+      oledClimate.setCursor(0, 20);
+      oledClimate.print("TEMP:");
+      oledClimate.setTextSize(2);
+      oledClimate.setCursor(0, 30);
+      oledClimate.print(lastTemp, 1);
+      oledClimate.print(" C");
+      oledClimate.setTextSize(1);
+      oledClimate.setCursor(0, 51);
+      oledClimate.print("UMIDADE: ");
+      oledClimate.print(lastHumidity, 1);
+      oledClimate.print("%");
+    } else {
+      oledClimate.setCursor(10, 30);
+      oledClimate.println("SEM LEITURA");
+    }
+    oledClimate.display();
+  }
 }
 
 void setup() {
   Serial.begin(SERIAL_BAUD);
-  delay(200);
-  Wire.begin(SDA_PIN, SCL_PIN);
+  delay(1000); // Aguarda a serial estabilizar para evitar travamentos de boot
+  
+  Wire.begin(MAIN_SDA_PIN, MAIN_SCL_PIN);
   Wire.setClock(100000);
-  oledReady = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
-  if (!oledReady) Serial.println("[OLED] Nao detectado; seguindo sem tela.");
+  secondaryI2C.begin(SECOND_SDA_PIN, SECOND_SCL_PIN);
+  secondaryI2C.setClock(100000);
+
+  oledCO2Ready = oledCO2.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  oledClimateReady = oledClimate.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  if (!oledCO2Ready) Serial.println("[OLED1] Nao encontrado em GPIO4/5.");
+  if (!oledClimateReady) Serial.println("[OLED2] Nao encontrado em GPIO6/7.");
+
   telemetryTopic = String("co2nect/") + DEVICE_ID + "/telemetry";
   statusTopic = String("co2nect/") + DEVICE_ID + "/status";
   mqttClientId = String("co2nnect-") + DEVICE_ID;
+  
+  // Configura o cliente seguro com o certificado CA definido no config.h
+  secureClient.setCACert(MQTT_ROOT_CA);
+  
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setBufferSize(512);
   mqtt.setKeepAlive(20);
-  mqtt.setSocketTimeout(2);
+  mqtt.setSocketTimeout(5);
+  
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
-  // SNTP nativo do ESP32, com data/hora sempre em UTC.
+  
   configTime(0, 0, "pool.ntp.org", "time.google.com");
+  
   initSensorIfNeeded(millis());
-  refreshOled(millis());
-  Serial.println("[CO2NNECT] Firmware inicializado.");
+  refreshOleds(millis());
+  Serial.println("[CO2NNECT] Firmware iniciado com sucesso.");
 }
 
 void loop() {
@@ -208,6 +262,6 @@ void loop() {
   connectMqttIfNeeded(now);
   if (mqtt.connected()) mqtt.loop();
   publishReading(now);
-  refreshOled(now);
+  refreshOleds(now);
   delay(5);
 }

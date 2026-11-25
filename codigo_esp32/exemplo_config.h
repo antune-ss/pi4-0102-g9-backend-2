@@ -1,9 +1,23 @@
 #pragma once
-// Copie este arquivo para config.h e preencha os valores locais.
-// Nunca publique config.h com senhas reais.
+
+// WI-FI
 #define WIFI_SSID "SEU_WIFI"
 #define WIFI_PASSWORD "SUA_SENHA"
-#define MQTT_HOST "192.168.1.100"  // IP LAN do computador com Mosquitto
-#define MQTT_PORT 1883
+
+// BROKER MQTT (EMQX / TLS)
+#define MQTT_HOST "seu-cluster.emqxsl.com"
+#define MQTT_PORT 8883
+
+// AUTENTICACAO MQTT
+#define MQTT_USER "SEU_USUARIO_MQTT"
+#define MQTT_PASSWORD "SUA_SENHA_MQTT"
+
+// IDENTIFICACAO DO DISPOSITIVO
 #define DEVICE_ID "ESP32-SALA-01"
-// Se o broker exigir autenticação, adapte a chamada MQTT connect().
+
+// CERTIFICADO CA (PEM)
+static const char MQTT_ROOT_CA[] = R"PEM(
+-----BEGIN CERTIFICATE-----
+COLE_AQUI_O_CERTIFICADO_CA
+-----END CERTIFICATE-----
+)PEM";

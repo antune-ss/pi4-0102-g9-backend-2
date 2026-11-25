@@ -9,4 +9,4 @@ core/
 # Configurações de editores
 .vscode/
 .idea/
-.DS_Store
+.DS_Storecodigo_esp32/config.h
